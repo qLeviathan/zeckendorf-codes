@@ -12,3 +12,5 @@ htmlcov/
 .tox/
 .nox/
 .hypothesis/
+.sicp_cache/
+.lattice_cache/
