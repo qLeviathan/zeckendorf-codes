@@ -23,6 +23,13 @@ from rtl_operations import FibonacciSeq, RTLDecomposer
 from validation_rules import LatticeValidator, ValidationReport
 from lattice_encoder import VocabularyEncoder, TokenEncoder, EncodedToken, LucasPrefilter
 from bit_collapse import BitCollapseEngine, LatticeInferencePipeline, InferenceState, CassiniVerifier
+from iir_accumulators import (
+    FibonacciIIRBank,
+    PhaseSpaceInferencePipeline,
+    PhaseSpaceInferenceResult,
+    PredictionLUT,
+    FIBONACCI_DELTAS
+)
 
 
 @dataclass
@@ -47,6 +54,12 @@ class InferenceResult:
     cascade_depth: int
     validation_passed: bool
     validation_report: Optional[ValidationReport] = None
+    # Phase-space extensions
+    psi_bits: Optional[List[int]] = None  # Velocity channel
+    accumulator_values: Optional[Dict[int, float]] = None  # IIR states
+    context_address: Optional[int] = None  # LUT address
+    prediction: Optional[Tuple[int, float]] = None  # (value, confidence)
+    velocity_magnitude: int = 0
 
 
 @dataclass
@@ -58,6 +71,12 @@ class PipelineStats:
     avg_cascade_depth: float = 0.0
     validation_failures: int = 0
     unique_patterns: int = 0
+    # IIR accumulator stats
+    max_velocity_magnitude: int = 0
+    avg_velocity_magnitude: float = 0.0
+    lut_hit_rate: float = 0.0
+    prediction_accuracy: float = 0.0
+    total_context_addresses: int = 0
 
 
 class ZeroRAMLattice:
@@ -82,8 +101,16 @@ class ZeroRAMLattice:
         self.validator = LatticeValidator()
         self.cassini = CassiniVerifier()
 
+        # IIR Accumulator Bank and Phase-Space Pipeline
+        self.iir_bank = FibonacciIIRBank(bit_width=self.config.bit_width)
+        self.phase_space_pipeline = PhaseSpaceInferencePipeline(
+            bit_width=self.config.bit_width,
+            lut_address_bits=12
+        )
+
         self._stats = PipelineStats()
         self._pattern_cache: Dict[str, List[int]] = {}
+        self._velocity_history: List[int] = []
 
         # Ensure cache directory exists
         os.makedirs(self.config.cache_dir, exist_ok=True)
@@ -158,8 +185,11 @@ class ZeroRAMLattice:
         for pos, enc_token in enumerate(encoded_tokens):
             input_bits = enc_token.zeckendorf_bits
 
-            # Run one inference cycle
+            # Run one inference cycle (standard pipeline)
             state = self.inference_pipeline.step(input_bits)
+
+            # Run phase-space inference (IIR + velocity)
+            ps_result = self.phase_space_pipeline.step(input_bits)
 
             # Update stats
             self._stats.total_collapses += state.cascade_depth
@@ -167,6 +197,14 @@ class ZeroRAMLattice:
                 self._stats.max_cascade_depth,
                 state.cascade_depth
             )
+
+            # Update velocity stats
+            self._velocity_history.append(ps_result.velocity_magnitude)
+            self._stats.max_velocity_magnitude = max(
+                self._stats.max_velocity_magnitude,
+                ps_result.velocity_magnitude
+            )
+            self._stats.total_context_addresses += 1
 
             # Cache unique patterns
             pattern_key = str(state.current_bits)
@@ -199,7 +237,13 @@ class ZeroRAMLattice:
                 polarity=state.polarity,
                 cascade_depth=state.cascade_depth,
                 validation_passed=validation_passed,
-                validation_report=validation_report
+                validation_report=validation_report,
+                # Phase-space extensions
+                psi_bits=ps_result.psi_bits,
+                accumulator_values=ps_result.accumulator_values,
+                context_address=ps_result.context_address,
+                prediction=ps_result.prediction,
+                velocity_magnitude=ps_result.velocity_magnitude
             )
 
     def _bits_to_value(self, bits: List[int]) -> int:
@@ -228,12 +272,22 @@ class ZeroRAMLattice:
             self._stats.avg_cascade_depth = (
                 self._stats.total_collapses / self._stats.total_tokens
             )
+        if self._velocity_history:
+            self._stats.avg_velocity_magnitude = (
+                sum(self._velocity_history) / len(self._velocity_history)
+            )
+        # Get LUT stats from phase-space pipeline
+        self._stats.lut_hit_rate = self.phase_space_pipeline.prediction_lut.get_hit_rate()
+        self._stats.prediction_accuracy = self.phase_space_pipeline.get_prediction_accuracy()
         return self._stats
 
     def reset_stats(self):
         """Reset statistics."""
         self._stats = PipelineStats()
         self._pattern_cache.clear()
+        self._velocity_history.clear()
+        self.phase_space_pipeline.reset()
+        self.iir_bank.reset()
 
     def save_vocabulary(self, path: str):
         """Save vocabulary to file."""
@@ -324,24 +378,31 @@ def demonstrate_pipeline():
     print(f"   Max representable ID: {lattice.token_encoder.max_value}")
 
     # Run inference on test text
-    print("\n2. RUNNING INFERENCE")
+    print("\n2. RUNNING INFERENCE WITH PHASE-SPACE")
     print("-" * 50)
     test_text = "The Fibonacci sequence"
 
     print(f"   Input: \"{test_text}\"")
     print()
-    print("   Token    | Input Bits (first 12) | Output Bits | Value | Cycle | Polarity | Depth | Valid")
-    print("   " + "-" * 95)
+    print("   Token    | φ (position)  | |ψ| | A_1    | A_2    | Context | Pred")
+    print("   " + "-" * 75)
 
     for result in lattice.run_inference(test_text):
-        input_str = ''.join(map(str, result.input_bits[:12]))
-        output_str = ''.join(map(str, result.output_bits[:12]))
-        polarity_str = '+1' if result.polarity > 0 else '-1'
-        valid_str = 'YES' if result.validation_passed else 'NO'
+        phi_str = ''.join(map(str, result.output_bits[:10]))
 
-        print(f"   {result.input_text:10s} | {input_str:12s}... | {output_str}... | "
-              f"{result.output_value:5d} | {result.clock_cycle:5d} | {polarity_str:8s} | "
-              f"{result.cascade_depth:5d} | {valid_str}")
+        # Get accumulator values
+        a1 = result.accumulator_values.get(1, 0) if result.accumulator_values else 0
+        a2 = result.accumulator_values.get(2, 0) if result.accumulator_values else 0
+
+        ctx_str = f"0x{result.context_address:03X}" if result.context_address else "---"
+
+        pred_str = "---"
+        if result.prediction:
+            pred_val, pred_conf = result.prediction
+            pred_str = f"{pred_val:3d}"
+
+        print(f"   {result.input_text:10s} | {phi_str}... | {result.velocity_magnitude:2d}  | "
+              f"{a1:6.1f} | {a2:6.1f} | {ctx_str:7s} | {pred_str}")
 
     # Show stats
     print("\n3. PIPELINE STATISTICS")
@@ -353,6 +414,12 @@ def demonstrate_pipeline():
     print(f"   Average cascade depth: {stats.avg_cascade_depth:.2f}")
     print(f"   Unique bit patterns: {stats.unique_patterns}")
     print(f"   Validation failures: {stats.validation_failures}")
+    print()
+    print("   Phase-Space Statistics:")
+    print(f"   Max velocity magnitude: {stats.max_velocity_magnitude}")
+    print(f"   Avg velocity magnitude: {stats.avg_velocity_magnitude:.2f}")
+    print(f"   LUT hit rate: {stats.lut_hit_rate*100:.1f}%")
+    print(f"   Prediction accuracy: {stats.prediction_accuracy*100:.1f}%")
 
     # Verify Cassini identity
     print("\n4. CASSINI IDENTITY VERIFICATION")

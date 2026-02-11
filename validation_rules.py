@@ -659,6 +659,339 @@ class ClockSyncRule(ValidationRule):
 
 
 # =============================================================================
+# IIR ACCUMULATOR RULES (A-series)
+# =============================================================================
+
+class IIRDecayFactorRule(ValidationRule):
+    """
+    A001: IIR Decay Factor Correctness
+
+    Each accumulator with delta δ must have decay factor = 1 - 2^{-δ}.
+    For Fibonacci-spaced deltas {1, 2, 3, 5}:
+    - δ=1: decay = 0.5
+    - δ=2: decay = 0.75
+    - δ=3: decay = 0.875
+    - δ=5: decay = 0.96875
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="A001",
+            description="IIR decay factor = 1 - 2^{-δ}",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+        self.expected_decays = {
+            1: 0.5,
+            2: 0.75,
+            3: 0.875,
+            5: 0.96875
+        }
+
+    def check(self, delta: int, actual_decay: float, tolerance: float = 1e-10) -> RuleResult:
+        """Verify decay factor matches formula."""
+        if delta not in self.expected_decays:
+            return self._fail(
+                f"Delta {delta} not in Fibonacci set {{1, 2, 3, 5}}",
+                {"delta": delta}
+            )
+
+        expected = self.expected_decays[delta]
+        if abs(actual_decay - expected) > tolerance:
+            return self._fail(
+                f"Decay mismatch for δ={delta}: expected {expected}, got {actual_decay}",
+                {"delta": delta, "expected": expected, "actual": actual_decay}
+            )
+        return self._pass(context={"delta": delta, "decay_factor": actual_decay})
+
+
+class IIRUpdateRule(ValidationRule):
+    """
+    A002: IIR Update Equation
+
+    Accumulator update must follow: A_δ(t) = A_δ(t-1) × (1 - 2^{-δ}) + x(t)
+
+    This ensures temporal context is properly maintained with exponential decay.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="A002",
+            description="IIR update equation A(t) = A(t-1)×decay + x(t)",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(
+        self,
+        prev_value: float,
+        input_value: float,
+        new_value: float,
+        decay_factor: float,
+        tolerance: float = 1e-6
+    ) -> RuleResult:
+        """Verify IIR update was computed correctly."""
+        expected = prev_value * decay_factor + input_value
+
+        if abs(new_value - expected) > tolerance:
+            return self._fail(
+                f"IIR update mismatch: expected {expected:.6f}, got {new_value:.6f}",
+                {"prev": prev_value, "input": input_value, "expected": expected, "actual": new_value}
+            )
+        return self._pass(context={"prev": prev_value, "input": input_value, "result": new_value})
+
+
+class ContextAddressRule(ValidationRule):
+    """
+    A003: Context Address Formation
+
+    Context address must be deterministic and consistent for same accumulator states.
+    ctx = hash(A_1 ⊕ A_2 ⊕ A_3 ⊕ A_5)
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="A003",
+            description="Context address determinism and consistency",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(
+        self,
+        acc_states: Dict[int, float],
+        context_addr_1: int,
+        context_addr_2: int
+    ) -> RuleResult:
+        """Verify context address is deterministic."""
+        if context_addr_1 != context_addr_2:
+            return self._fail(
+                f"Context address non-deterministic: {context_addr_1} != {context_addr_2}",
+                {"states": acc_states, "addr1": context_addr_1, "addr2": context_addr_2}
+            )
+        return self._pass(context={"address": context_addr_1})
+
+
+class FibonacciDeltaRule(ValidationRule):
+    """
+    A004: Fibonacci-Spaced Delta Constraint
+
+    Accumulator deltas must be from Fibonacci sequence: {1, 2, 3, 5}.
+    This ensures multi-scale temporal alignment with Zeckendorf structure.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="A004",
+            description="Deltas must be Fibonacci: {1, 2, 3, 5}",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+        self.valid_deltas = {1, 2, 3, 5}
+
+    def check(self, deltas: List[int]) -> RuleResult:
+        """Verify all deltas are from Fibonacci set."""
+        invalid = [d for d in deltas if d not in self.valid_deltas]
+        if invalid:
+            return self._fail(
+                f"Invalid deltas: {invalid} not in Fibonacci set {self.valid_deltas}",
+                {"invalid_deltas": invalid, "valid_set": list(self.valid_deltas)}
+            )
+        return self._pass(context={"deltas": deltas})
+
+
+# =============================================================================
+# PHASE-SPACE RULES (PS-series)
+# =============================================================================
+
+class PhiChannelRule(ValidationRule):
+    """
+    PS001: Phi (Position) Channel Validity
+
+    The phi channel must contain valid Zeckendorf bits (no adjacent 1s).
+    φ-rail carries position information in Fibonacci space.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="PS001",
+            description="Phi channel is valid Zeckendorf",
+            severity=RuleSeverity.FATAL,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(self, phi_bits: List[int]) -> RuleResult:
+        """Verify phi channel is valid Zeckendorf."""
+        zeck_rule = ZeckendorfConstraintRule()
+        result = zeck_rule.check(phi_bits)
+        if not result.passed:
+            return self._fail(
+                f"Phi channel invalid: {result.message}",
+                {"phi_bits": phi_bits}
+            )
+        return self._pass(context={"phi_bits": phi_bits})
+
+
+class PsiVelocityRule(ValidationRule):
+    """
+    PS002: Psi (Velocity) Channel Computation
+
+    ψ(t) = φ(t) - φ(t-1) must hold.
+    Velocity is the discrete derivative in Fibonacci space.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="PS002",
+            description="Psi = discrete derivative of phi",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(
+        self,
+        phi_current: List[int],
+        phi_prev: List[int],
+        psi: List[int]
+    ) -> RuleResult:
+        """Verify psi is correctly computed from phi."""
+        # Extend to same length
+        max_len = max(len(phi_current), len(phi_prev), len(psi))
+        phi_curr_ext = phi_current + [0] * (max_len - len(phi_current))
+        phi_prev_ext = phi_prev + [0] * (max_len - len(phi_prev))
+        psi_ext = psi + [0] * (max_len - len(psi))
+
+        # Check each position
+        errors = []
+        for i in range(max_len):
+            expected = phi_curr_ext[i] - phi_prev_ext[i]
+            if psi_ext[i] != expected:
+                errors.append(f"psi[{i}]={psi_ext[i]}, expected {expected}")
+
+        if errors:
+            return self._fail(
+                f"Velocity computation errors: {'; '.join(errors[:5])}",
+                {"phi_current": phi_current, "phi_prev": phi_prev, "psi": psi}
+            )
+        return self._pass(context={"velocity_magnitude": sum(abs(v) for v in psi)})
+
+
+class PhaseSpacePolarityRule(ValidationRule):
+    """
+    PS003: Phase-Space Polarity Consistency
+
+    Phase-space state must track polarity (-1)^n correctly.
+    The phi-psi product maintains Cassini-like parity.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="PS003",
+            description="Phase-space polarity = (-1)^n",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(self, clock_cycle: int, reported_polarity: int) -> RuleResult:
+        """Verify phase-space polarity."""
+        expected = (-1) ** clock_cycle
+        if reported_polarity != expected:
+            return self._fail(
+                f"Polarity mismatch: clock={clock_cycle}, expected {expected}, got {reported_polarity}",
+                {"clock_cycle": clock_cycle, "expected": expected, "actual": reported_polarity}
+            )
+        return self._pass(context={"clock_cycle": clock_cycle, "polarity": expected})
+
+
+class VelocityBoundRule(ValidationRule):
+    """
+    PS004: Velocity Magnitude Bound
+
+    |ψ| should be bounded relative to bit width.
+    Large velocities indicate rapid state changes requiring attention.
+    """
+
+    def __init__(self, max_magnitude: int = 10):
+        super().__init__(
+            rule_id="PS004",
+            description="Velocity magnitude bounded",
+            severity=RuleSeverity.WARNING,
+            category=RuleCategory.PIPELINE
+        )
+        self.max_magnitude = max_magnitude
+
+    def check(self, psi: List[int]) -> RuleResult:
+        """Check velocity magnitude is within bounds."""
+        magnitude = sum(abs(v) for v in psi)
+        if magnitude > self.max_magnitude:
+            return self._fail(
+                f"High velocity: |ψ|={magnitude} exceeds threshold {self.max_magnitude}",
+                {"psi": psi, "magnitude": magnitude, "threshold": self.max_magnitude}
+            )
+        return self._pass(context={"magnitude": magnitude})
+
+
+# =============================================================================
+# PREDICTION LUT RULES (L-series)
+# =============================================================================
+
+class LUTAddressRangeRule(ValidationRule):
+    """
+    L001: LUT Address Range Validity
+
+    Context addresses must be within valid LUT range: 0 <= addr < 2^{address_bits}.
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="L001",
+            description="LUT address within valid range",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(self, address: int, address_bits: int) -> RuleResult:
+        """Verify address is within range."""
+        max_addr = (1 << address_bits) - 1
+        if address < 0 or address > max_addr:
+            return self._fail(
+                f"Address {address} out of range [0, {max_addr}]",
+                {"address": address, "max_address": max_addr}
+            )
+        return self._pass(context={"address": address, "address_bits": address_bits})
+
+
+class LUTPredictionRule(ValidationRule):
+    """
+    L002: LUT Prediction Consistency
+
+    Same context address should yield same prediction (determinism).
+    """
+
+    def __init__(self):
+        super().__init__(
+            rule_id="L002",
+            description="LUT prediction deterministic",
+            severity=RuleSeverity.ERROR,
+            category=RuleCategory.PIPELINE
+        )
+
+    def check(
+        self,
+        address: int,
+        prediction_1: Optional[Tuple[int, float]],
+        prediction_2: Optional[Tuple[int, float]]
+    ) -> RuleResult:
+        """Verify predictions are consistent."""
+        if prediction_1 != prediction_2:
+            return self._fail(
+                f"Non-deterministic prediction for address {address}",
+                {"address": address, "pred1": prediction_1, "pred2": prediction_2}
+            )
+        return self._pass(context={"address": address, "prediction": prediction_1})
+
+
+# =============================================================================
 # RULE REGISTRY AND VALIDATOR
 # =============================================================================
 
@@ -695,6 +1028,22 @@ class RuleRegistry:
         self.register(PolarityRule())
         self.register(StateValidityRule())
         self.register(ClockSyncRule())
+
+        # IIR Accumulator rules
+        self.register(IIRDecayFactorRule())
+        self.register(IIRUpdateRule())
+        self.register(ContextAddressRule())
+        self.register(FibonacciDeltaRule())
+
+        # Phase-Space rules
+        self.register(PhiChannelRule())
+        self.register(PsiVelocityRule())
+        self.register(PhaseSpacePolarityRule())
+        self.register(VelocityBoundRule())
+
+        # Prediction LUT rules
+        self.register(LUTAddressRangeRule())
+        self.register(LUTPredictionRule())
 
     def register(self, rule: ValidationRule):
         """Register a validation rule."""
@@ -866,6 +1215,85 @@ class LatticeValidator:
         # P003: Clock sync
         max_active = max((i for i, b in enumerate(bits) if b == 1), default=0)
         report.add(self.registry.get("P003").check(clock_n, max_active))
+
+        return report
+
+    def validate_iir_accumulator(
+        self,
+        delta: int,
+        decay_factor: float,
+        prev_value: float,
+        input_value: float,
+        new_value: float
+    ) -> ValidationReport:
+        """Validate IIR accumulator state and update."""
+        report = ValidationReport()
+
+        # A001: Decay factor correctness
+        report.add(self.registry.get("A001").check(delta, decay_factor))
+
+        # A002: Update equation
+        report.add(self.registry.get("A002").check(
+            prev_value, input_value, new_value, decay_factor
+        ))
+
+        return report
+
+    def validate_iir_bank(
+        self,
+        deltas: List[int],
+        acc_states: Dict[int, float],
+        context_addr: int,
+        address_bits: int = 12
+    ) -> ValidationReport:
+        """Validate IIR accumulator bank."""
+        report = ValidationReport()
+
+        # A004: Fibonacci delta constraint
+        report.add(self.registry.get("A004").check(deltas))
+
+        # L001: Context address range
+        report.add(self.registry.get("L001").check(context_addr, address_bits))
+
+        return report
+
+    def validate_phase_space(
+        self,
+        phi_bits: List[int],
+        phi_prev: List[int],
+        psi_bits: List[int],
+        clock_n: int,
+        polarity: int
+    ) -> ValidationReport:
+        """Validate phase-space state."""
+        report = ValidationReport()
+
+        # PS001: Phi channel validity
+        report.add(self.registry.get("PS001").check(phi_bits))
+
+        # PS002: Psi velocity computation
+        if phi_prev:  # Only check if we have previous state
+            report.add(self.registry.get("PS002").check(phi_bits, phi_prev, psi_bits))
+
+        # PS003: Polarity consistency
+        report.add(self.registry.get("PS003").check(clock_n, polarity))
+
+        # PS004: Velocity bound
+        report.add(self.registry.get("PS004").check(psi_bits))
+
+        return report
+
+    def validate_prediction_lut(
+        self,
+        address: int,
+        address_bits: int,
+        prediction: Optional[Tuple[int, float]] = None
+    ) -> ValidationReport:
+        """Validate prediction LUT operation."""
+        report = ValidationReport()
+
+        # L001: Address range
+        report.add(self.registry.get("L001").check(address, address_bits))
 
         return report
 
